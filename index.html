@@ -1631,58 +1631,63 @@ function toggleFisik() {
     }
 
     function processCheckout() {
+        var checkoutBtn = event.target;
+        checkoutBtn.disabled = true;
+        checkoutBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Menyimpan...';
+        
         var registeredCount = cart.length;
         var totalAmount = cart.length * PRICE_PER_ATLET;
+        var savePromises = [];
         
-        // Save to Supabase + LocalStorage
+        // Save to Supabase + Local (async non-blocking)
         cart.forEach(function(a) {
             a.status = 'pending';
             a.payment_date = new Date().toISOString();
             a.payment_code = generatedPaymentCode;
             a.official_id = currentUser.id || currentUser.email_official || 'local';
             
-            // Supabase save
-            if (supabase) {
-                supabase.from('athletes').insert([a]).catch(console.error);
-            }
-            
-            // Local fallback
+            // Local save immediate
             var allAthletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
             allAthletes.push(a);
             localStorage.setItem('all_athletes', JSON.stringify(allAthletes));
+            
+            // Supabase async (fire & forget)
+            if (supabase) {
+                savePromises.push(supabase.from('athletes').insert([a]));
+            }
         });
-
         
-        // Save History
-        var riwayat = JSON.parse(localStorage.getItem('riwayat_struk') || '[]');
-        var strukBaru = {
-            tanggal: new Date().toISOString(),
-            officialName: currentUser.name,
-            perguruan: currentUser.perguruan,
-            total: totalAmount,
-            atlet: cart.slice(),
-            paymentCode: generatedPaymentCode,
-            status: 'pending'
-        };
-        riwayat.push(strukBaru);
-        localStorage.setItem('riwayat_struk', JSON.stringify(riwayat));
-        
-        // Show Receipt
-        currentStruk = strukBaru;
-        renderStruk(strukBaru);
-        
-        closeCheckout();
-        document.getElementById('lihatStrukModal').style.display = 'flex';
-        
-        // Update Total Registrants (persist across sessions) - SEMUA pendaftar
-        var allAthletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
-        document.getElementById('totalRegistrants').innerHTML = allAthletes.length.toLocaleString('id-ID');
-        
-        // Clear cart but keep payment code for reference
-        cart = [];
-        localStorage.removeItem('cart');
-        renderCart();
+        // Wait all saves then continue
+        Promise.allSettled(savePromises).then(() => {
+            checkoutBtn.disabled = false;
+            checkoutBtn.innerHTML = 'LANJUT & DOWNLOAD BUKTI PENDAFTARAN';
+            
+            // Save History & Show Receipt
+            var riwayat = JSON.parse(localStorage.getItem('riwayat_struk') || '[]');
+            var strukBaru = {
+                tanggal: new Date().toISOString(),
+                officialName: currentUser.name,
+                perguruan: currentUser.perguruan,
+                total: totalAmount,
+                atlet: cart.slice(),
+                paymentCode: generatedPaymentCode,
+                status: 'pending'
+            };
+            riwayat.push(strukBaru);
+            localStorage.setItem('riwayat_struk', JSON.stringify(riwayat));
+            
+            currentStruk = strukBaru;
+            renderStruk(strukBaru);
+            closeCheckout();
+            document.getElementById('lihatStrukModal').style.display = 'flex';
+            
+            updateTotalRegistrants();
+            cart = [];
+            localStorage.removeItem('cart');
+            renderCart();
+        }).catch(console.error);
     }
+
 
     // ==================== STRUK RECEIPT ====================
     function renderStruk(data) {
@@ -1802,41 +1807,44 @@ function toggleFisik() {
     }
 
 function downloadPDF() {
-    if (!currentStruk) return;
+    var pdfBtn = event.target;
+    pdfBtn.disabled = true;
+    pdfBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Generating PDF...';
+    
+    if (!currentStruk) {
+        pdfBtn.disabled = false;
+        pdfBtn.innerHTML = 'Download PDF';
+        return;
+    }
+    
     var source = document.getElementById("strukContent");
-
     if (!source || !source.innerText.trim()) {
-        alert("Gagal: struk belum siap. Pastikan struk sudah ditampilkan sebelum download.");
+        alert("Gagal: struk belum siap.");
+        pdfBtn.disabled = false;
+        pdfBtn.innerHTML = 'Download PDF';
         return;
     }
 
     const opt = {
-        margin:       25.4, // ✅ 2,54 cm = 25.4 mm
-        filename:     "Struk_IPSI_CUP3_" + currentStruk.officialName + ".pdf",
-        image:        { type: "jpeg", quality: 0.98 },
-        html2canvas:  { scale: 2, useCORS: true },
-        jsPDF:        { unit: "mm", format: "a4", orientation: "portrait" },
-        pagebreak:    { mode: ['css', 'legacy'] }
+        margin: 10,
+        filename: "Struk_IPSI_CUP3_" + currentStruk.officialName.replace(/[^a-z0-9]/gi, '_') + ".pdf",
+        image: { type: "jpeg", quality: 0.95 },
+        html2canvas: { scale: 1.5, useCORS: true, logging: false },
+        jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+        pagebreak: { mode: ['avoid-all', 'css'] }
     };
 
-    html2pdf().set(opt).from(source).toPdf().get('pdf').then(function (pdf) {
-        const totalPages = pdf.internal.getNumberOfPages();
-        const pageWidth = pdf.internal.pageSize.getWidth();
-        const pageHeight = pdf.internal.pageSize.getHeight();
-
-        for (let i = 1; i <= totalPages; i++) {
-            pdf.setPage(i);
-
-            // Garis tipis dekat footer
-            pdf.setDrawColor(150);
-            pdf.setLineWidth(0.2);
-            pdf.line(25.4, pageHeight - 12, pageWidth - 25.4, pageHeight - 12);
-            
-            // Footer di tengah bawah (benar-benar nempel bawah margin)
-            pdf.setFontSize(8);
-            pdf.text("Halaman " + i + " dari " + totalPages, pageWidth / 2, pageHeight - 6, { align: "center" });
-        }
-    }).save("Struk_IPSI_CUP3_" + currentStruk.officialName + ".pdf");
+    html2pdf().set(opt).from(source).save().finally(() => {
+        pdfBtn.disabled = false;
+        pdfBtn.innerHTML = 'Download PDF';
+    }).catch((err) => {
+        console.error('PDF error:', err);
+        alert('PDF generation failed. Trying simpler method...');
+        // Fallback: window.print()
+        window.print();
+        pdfBtn.disabled = false;
+        pdfBtn.innerHTML = 'Download PDF';
+    });
 }
     // ==================== REMINDER MODAL ====================
     function closeReminderModal() {
