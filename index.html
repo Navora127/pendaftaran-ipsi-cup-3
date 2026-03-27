@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
@@ -1203,9 +1203,21 @@
         loadCart();
         loadNews();
         
-        // Load & display total registrants (SEMUA pendaftar)
-        var allAthletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
-        document.getElementById('totalRegistrants').innerHTML = allAthletes.length.toLocaleString('id-ID');
+        // Load & display total registrants (Supabase realtime)
+        updateTotalRegistrants();
+
+        // Realtime total registrants
+        if (supabase) {
+            const totalChannel = supabase.channel('total-registrants')
+                .on('postgres_changes', 
+                    { event: '*', schema: 'public', table: 'athletes' },
+                    () => {
+                        updateTotalRegistrants();
+                    }
+                )
+                .subscribe();
+        }
+
 
         updateAdminUI();
     }
@@ -1556,14 +1568,21 @@ function performLogin(name, code, identifier) {
         renderCart();
     }
 
-    function toggleFisik() {
-        var category = document.getElementById('formCategory').value;
-        var fisik = document.getElementById('fisikContainer');
-        var kelasContainer = document.getElementById('formKelasContainer');
-        var show = (category === 'Tanding');
-        fisik.style.display = show ? 'block' : 'none';
-        kelasContainer.style.display = show ? 'block' : 'none';
+function toggleFisik() {
+    var category = document.getElementById('formCategory').value;
+    var fisik = document.getElementById('fisikContainer');
+    var kelasContainer = document.getElementById('formKelasContainer');
+    var show = (category === 'Tanding');
+    fisik.style.display = show ? 'block' : 'none';
+    kelasContainer.style.display = show ? 'block' : 'none';
+    
+    // Reset form fields when hidden
+    if (!show) {
+        document.getElementById('formKelas').value = '-';
+        document.getElementById('formBb').value = '';
+        document.getElementById('formTb').value = '';
     }
+}
 
     // ==================== PEMBAYARAN - KODE PEMBAYARAN ====================
     function generatePaymentCode() {
@@ -1615,15 +1634,24 @@ function performLogin(name, code, identifier) {
         var registeredCount = cart.length;
         var totalAmount = cart.length * PRICE_PER_ATLET;
         
-        // Save to LocalStorage with payment code
-        var allAthletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
+        // Save to Supabase + LocalStorage
         cart.forEach(function(a) {
             a.status = 'pending';
             a.payment_date = new Date().toISOString();
             a.payment_code = generatedPaymentCode;
+            a.official_id = currentUser.id || currentUser.email_official || 'local';
+            
+            // Supabase save
+            if (supabase) {
+                supabase.from('athletes').insert([a]).catch(console.error);
+            }
+            
+            // Local fallback
+            var allAthletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
             allAthletes.push(a);
+            localStorage.setItem('all_athletes', JSON.stringify(allAthletes));
         });
-        localStorage.setItem('all_athletes', JSON.stringify(allAthletes));
+
         
         // Save History
         var riwayat = JSON.parse(localStorage.getItem('riwayat_struk') || '[]');
@@ -2248,18 +2276,33 @@ function uploadFile(fieldId) {
     var invoiceNumber = document.getElementById('invoiceNumber').value;
     var invoiceNote = document.getElementById('invoiceNote').value;
 
-    var athletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
-
-    if (athletes.length > 0) {
-        var lastAthlete = athletes[athletes.length - 1];
-        lastAthlete.invoice_id = invoiceNumber;   // simpan nomor invoice
-        lastAthlete.invoice_note = invoiceNote;   // simpan catatan
+    if (supabase && currentUser) {
+        supabase
+            .from('athletes')
+            .update({ 
+                invoice_id: invoiceNumber,
+                invoice_note: invoiceNote 
+            })
+            .eq('official_id', currentUser.id || currentUser.email_official)
+            .gte('created_at', new Date(Date.now() - 24*60*60*1000).toISOString()) // last 24h
+            .then(({ data, error }) => {
+                if (error) console.error('Invoice save error:', error);
+            });
     }
 
-    localStorage.setItem('all_athletes', JSON.stringify(athletes));
+    // Local save fallback
+    var athletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
+    if (athletes.length > 0) {
+        athletes.slice(-5).forEach(a => { // last 5 athletes
+            a.invoice_id = invoiceNumber;
+            a.invoice_note = invoiceNote;
+        });
+        localStorage.setItem('all_athletes', JSON.stringify(athletes));
+    }
 
-    alert("Sukses, pendaftaran akan segera diverifikasi!");
+    alert("✅ Invoice tersimpan di database!");
     closeInvoiceModal();
+    if (isAdmin) loadAdminData();
 }
 
     function openAdminPanel() {
@@ -2297,22 +2340,60 @@ function uploadFile(fieldId) {
         }
     }
 
-    function loadAdminData() {
-        var athletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
-        if(supabase) {
-            supabase.from('athletes').select('*').then(function(result) {
-                if(result.data && result.data.length > 0) {
-                    var supabaseIds = athletes.map(function(a) { return a.id; });
-                    result.data.forEach(function(a) {
-                        if(!supabaseIds.includes(a.id)) { athletes.push(a); }
-                    });
-                }
-                renderAdminTable(athletes);
-            }).catch(function(e) { renderAdminTable(athletes); });
-        } else { 
-            renderAdminTable(athletes); 
-        }
+function loadAdminData() {
+    if (!supabase) {
+        console.error('Supabase not available. Admin panel requires database connection.');
+        renderAdminTable([]);
+        return;
     }
+
+    supabase
+        .from('athletes')
+        .select('*')
+        .order('payment_date', { ascending: false })
+        .then(({ data: athletes, error }) => {
+            if (error) {
+                console.error('Supabase load error:', error);
+                alert('Error loading admin data: ' + error.message + '\nPlease check Supabase connection.');
+                renderAdminTable([]);
+            } else {
+                console.log('Loaded ' + (athletes || []).length + ' athletes from database');
+                renderAdminTable(athletes || []);
+            }
+        });
+}
+
+function updateTotalRegistrants() {
+    if (supabase) {
+        supabase
+            .from('athletes')
+            .select('id', { count: 'exact', head: true })
+            .then(({ count, error }) => {
+                if (error) {
+                    console.error('Total count error:', error);
+                    // Fallback local
+                    var localCount = JSON.parse(localStorage.getItem('all_athletes') || '[]').length;
+                    document.getElementById('totalRegistrants').innerHTML = localCount.toLocaleString('id-ID');
+                } else {
+                    document.getElementById('totalRegistrants').innerHTML = (count || 0).toLocaleString('id-ID');
+                }
+            });
+    } else {
+        var allAthletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
+        document.getElementById('totalRegistrants').innerHTML = allAthletes.length.toLocaleString('id-ID');
+    }
+}
+
+// Global realtime for homepage total (if on home page)
+if (document.getElementById('page-home').classList.contains('active') && supabase) {
+    const totalChannel = supabase.channel('total-registrants-home')
+        .on('postgres_changes', 
+            { event: '*', schema: 'public', table: 'athletes' },
+            () => updateTotalRegistrants()
+        )
+        .subscribe();
+}
+
 
     function renderAdminTable(athletes) {
         var paid = athletes.filter(function(a) { return a.status === 'paid'; });
@@ -2344,7 +2425,30 @@ function uploadFile(fieldId) {
     }
 
    function exportExcel() {
+    if (supabase) {
+        supabase
+            .from('athletes')
+            .select('*')
+            .order('payment_date', { ascending: false })
+            .then(({ data: athletes, error }) => {
+                if (error) {
+                    console.error('Export error:', error);
+                    exportLocalExcel();
+                    return;
+                }
+                generateExcel(athletes);
+            });
+    } else {
+        exportLocalExcel();
+    }
+}
+
+function exportLocalExcel() {
     var athletes = JSON.parse(localStorage.getItem('all_athletes') || '[]');
+    generateExcel(athletes);
+}
+
+function generateExcel(athletes) {
     if (athletes.length === 0) { 
         alert('Belum ada data!'); 
         return; 
@@ -2353,9 +2457,10 @@ function uploadFile(fieldId) {
     var excelData = athletes.map(function(a, index) {
         return {
             'No': index + 1,
-            'Invoice ID': a.invoice_id || a.official_invoice || '-',
+            'Invoice ID': a.invoice_id || '-',
             'Kode Pendaftaran': a.payment_code || '',
-            'Catatan': a.invoice_note || '',   // kolom baru untuk catatan            'Nama Atlet': a.name || '',
+            'Catatan': a.invoice_note || '',
+            'Nama Atlet': a.name || '',
             'TTL': a.ttl || '',
             'JK': a.gender || '',
             'Kategori': a.category || '',
@@ -2414,7 +2519,8 @@ function uploadFile(fieldId) {
     document.addEventListener('DOMContentLoaded', function() {
         startCountdown();
         checkAuth();
-        toggleFisik();
+        toggleFisik(); // Initial state
+        document.getElementById('formCategory').addEventListener('change', toggleFisik);
         var activityEvents = ['mousedown', 'keydown', 'scroll', 'touchstart'];
         activityEvents.forEach(function(event) {
             document.addEventListener(event, function() { resetSessionTimer(); }, { passive: true });
@@ -2423,3 +2529,4 @@ function uploadFile(fieldId) {
     </script>
 </body>
 </html>
+
